@@ -394,6 +394,8 @@ def restore_payload(payload):
 def security_headers(response):
     response.headers['X-Content-Type-Options']='nosniff'
     response.headers['X-Frame-Options']='DENY'
+    # Flask-WTF requires a Referer on HTTPS unsafe requests.
+    # same-origin keeps it available for this app's own CSRF-protected POSTs.
     response.headers['Referrer-Policy']='same-origin'
     response.headers['Cache-Control']='no-store, max-age=0'
     response.headers['Content-Security-Policy']="default-src 'self'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'"
@@ -503,11 +505,15 @@ def download_analysis(analysis_id):
 def export_analysis_chat(analysis_id):
     entry=get_analysis(analysis_id)
     if not entry: abort(404)
-    sessions=[s for s in fetch_all_data().get('sessions',[]) if s.get('analysis_id')==analysis_id]
-    messages=[]
-    for s in sessions:
-        messages.extend(get_messages(s['id']))
-    messages=sorted(messages,key=lambda x:str(x.get('created_at','')))
+    try:
+        data=fetch_all_data()
+        sessions=[s for s in data.get('sessions',[]) if s.get('analysis_id')==analysis_id]
+        messages=[m for m in data.get('messages',[]) if any(m.get('session_id')==s.get('id') for s in sessions)]
+        messages=sorted(messages,key=lambda x:str(x.get('created_at','')))
+    except Exception:
+        logger.exception('Chat history export failed for analysis %s', analysis_id)
+        flash('Chat history could not be loaded. Check the Neon database connection and try again.','error')
+        return redirect(url_for('analysis_view',analysis_id=analysis_id))
     body=''.join(f"<section><b>{html.escape(m.get('role','').title())}</b><p>{html.escape(m.get('content','')).replace(chr(10),'<br>')}</p></section>" for m in messages)
     page=f"<!doctype html><html><head><meta charset='utf-8'><title>GST 2B Chat</title><style>body{{font:15px Arial;max-width:900px;margin:40px auto;padding:0 18px;color:#172033}}section{{padding:12px;border-bottom:1px solid #ddd}}p{{white-space:normal;line-height:1.5}}</style></head><body><h1>GST 2B Reconciliation Chat - {html.escape(entry.get('month_label',''))}</h1>{body}</body></html>"
     return send_file(io.BytesIO(page.encode()),mimetype='text/html',as_attachment=True,download_name=month_chat_filename(entry.get('month_label','')))
@@ -564,11 +570,19 @@ def api_chat(session_id):
     question=(payload.get('message') or '').strip()[:2000]
     entry=get_analysis(s.get('analysis_id'))
     if not entry: return jsonify({'error':'Analysis not found.'}),404
-    add_message(session_id,'user',question)
-    report=entry.get('report_json') or {}; report['month_label']=entry.get('month_label','')
-    answer=assistant_answer(question,report,s.get('analysis_id'))
-    add_message(session_id,'assistant',answer)
-    return jsonify({'answer':answer,'messages':get_messages(session_id)})
+    if not question:
+        return jsonify({'error':'Please enter a question.'}),400
+    try:
+        report=entry.get('report_json') or {}
+        report['month_label']=entry.get('month_label','')
+        answer=assistant_answer(question,report,s.get('analysis_id'))
+        # Save both messages only after the deterministic answer has been calculated.
+        add_message(session_id,'user',question)
+        add_message(session_id,'assistant',answer)
+        return jsonify({'answer':answer,'messages':get_messages(session_id)})
+    except Exception:
+        logger.exception('GST assistant request failed for chat session %s', session_id)
+        return jsonify({'error':'The assistant could not save this chat. Check the Neon database connection and try again.'}),503
 
 
 @app.route('/history')
